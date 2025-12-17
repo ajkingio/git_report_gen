@@ -815,7 +815,7 @@ def main():
 
     # Summary
     print(f"\n{'=' * 60}")
-    print(f"Report generation complete!")
+    print("Report generation complete!")
     print(f"Total reports generated: {len(generated_reports)}")
     print(f"{'=' * 60}")
 
