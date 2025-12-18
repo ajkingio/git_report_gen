@@ -62,32 +62,72 @@ def is_github_repo(repo_path):
         return False
 
 
-def get_github_repo_url(repo_path):
-    """Get the GitHub repository URL from git remote."""
+def get_repo_url(repo_path):
+    """Get the repository URL from git remote (supports GitHub and GitLab)."""
     try:
         # Get the remote URL
         remote_url = run_git_command(repo_path, "config", "--get", "remote.origin.url")
         if not remote_url:
             return None
 
-        # Convert SSH URLs to HTTPS format
+        # Handle GitHub URLs
         # SSH format: git@github.com:owner/repo.git
         # HTTPS format: https://github.com/owner/repo.git or https://github.com/owner/repo
-        if remote_url.startswith("git@github.com:"):
-            # Convert git@github.com:owner/repo.git to https://github.com/owner/repo
-            repo_part = remote_url.replace("git@github.com:", "")
+        if "github.com" in remote_url:
+            if remote_url.startswith("git@github.com:"):
+                # Convert git@github.com:owner/repo.git to https://github.com/owner/repo
+                repo_part = remote_url.replace("git@github.com:", "")
+                if repo_part.endswith(".git"):
+                    repo_part = repo_part[:-4]  # Remove .git suffix
+                return f"https://github.com/{repo_part}"
+            else:
+                # Already HTTPS, just remove .git if present
+                if remote_url.endswith(".git"):
+                    return remote_url[:-4]  # Remove .git suffix
+                return remote_url
+
+        # Handle GitLab URLs
+        # SSH format: git@gitlab.com:owner/repo.git
+        # HTTPS format: https://gitlab.com/owner/repo.git or https://gitlab.com/owner/repo
+        elif "gitlab.com" in remote_url:
+            if remote_url.startswith("git@gitlab.com:"):
+                # Convert git@gitlab.com:owner/repo.git to https://gitlab.com/owner/repo
+                repo_part = remote_url.replace("git@gitlab.com:", "")
+                if repo_part.endswith(".git"):
+                    repo_part = repo_part[:-4]  # Remove .git suffix
+                return f"https://gitlab.com/{repo_part}"
+            else:
+                # Already HTTPS, just remove .git if present
+                if remote_url.endswith(".git"):
+                    return remote_url[:-4]  # Remove .git suffix
+                return remote_url
+
+        # Handle self-hosted GitLab instances (git@gitlab.example.com:)
+        elif remote_url.startswith("git@") and ":" in remote_url:
+            # Extract host and repo part
+            # Format: git@gitlab.example.com:owner/repo.git
+            at_index = remote_url.index("@")
+            colon_index = remote_url.index(":", at_index)
+            host = remote_url[at_index + 1 : colon_index]
+            repo_part = remote_url[colon_index + 1 :]
             if repo_part.endswith(".git"):
-                repo_part = repo_part[:-4]  # Remove .git suffix
-            return f"https://github.com/{repo_part}"
-        elif "github.com" in remote_url:
-            # Already HTTPS, just remove .git if present
+                repo_part = repo_part[:-4]
+            return f"https://{host}/{repo_part}"
+
+        # Handle HTTPS URLs for self-hosted instances
+        elif remote_url.startswith("https://") or remote_url.startswith("http://"):
             if remote_url.endswith(".git"):
-                return remote_url[:-4]  # Remove .git suffix
+                return remote_url[:-4]
             return remote_url
 
         return None
     except Exception:
         return None
+
+
+def get_github_repo_url(repo_path):
+    """Get the GitHub repository URL from git remote (deprecated - use get_repo_url)."""
+    return get_repo_url(repo_path)
 
 
 def get_commit_counts(repo_path, since):
@@ -493,8 +533,8 @@ def generate_github_summary_report(repo_path, since, period_description):
     """Generate a high-level GitHub summary report with issues and PRs."""
     repo_name = Path(repo_path).name
 
-    # Get the GitHub repository URL
-    repo_url = get_github_repo_url(repo_path)
+    # Get the repository URL
+    repo_url = get_repo_url(repo_path)
 
     # Start building the markdown report
     report = []
@@ -683,8 +723,8 @@ def generate_markdown_report(repo_path, since, period_description):
     """Generate a markdown report of git commits for the specified time period."""
     repo_name = Path(repo_path).name
 
-    # Get the GitHub repository URL
-    repo_url = get_github_repo_url(repo_path)
+    # Get the repository URL (supports GitHub, GitLab, and self-hosted instances)
+    repo_url = get_repo_url(repo_path)
 
     # Start building the markdown report
     report = []
@@ -734,12 +774,15 @@ def generate_markdown_report(repo_path, since, period_description):
         report.append("")
 
         for commit in commits:
-            commit_link = (
-                f"[{commit['hash']}]({repo_url}/commit/{commit['hash']})"
-                if repo_url
-                else commit["hash"]
-            )
-            report.append(f"- [{commit_link}] {commit['subject']} *({commit['date']})*")
+            if repo_url:
+                # GitLab uses /-/commit/, GitHub uses /commit/
+                commit_path = "/-/commit/" if "gitlab" in repo_url else "/commit/"
+                commit_link = (
+                    f"[{commit['hash']}]({repo_url}{commit_path}{commit['hash']})"
+                )
+            else:
+                commit_link = f"[{commit['hash']}]"
+            report.append(f"- {commit_link} {commit['subject']} *({commit['date']})*")
 
         report.append("")
         report.append("---")
