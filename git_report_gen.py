@@ -51,15 +51,57 @@ def run_gh_command(repo_path, *args, silent=False):
         return None
 
 
-def is_github_repo(repo_path):
-    """Check if the repository is hosted on GitHub."""
+def run_glab_command(repo_path, *args, silent=False):
+    """Run a GitLab CLI command in the specified repository."""
+    try:
+        result = subprocess.run(
+            ["glab"] + list(args),
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=repo_path,
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        # Silently return None for expected failures (auth issues, rate limits, etc.)
+        if silent:
+            return None
+        print(f"Error running glab command: {e}", file=sys.stderr)
+        return None
+    except FileNotFoundError:
+        if not silent:
+            print(
+                "Error: GitLab CLI (glab) is not installed or not in PATH.",
+                file=sys.stderr,
+            )
+            print("Install it from: https://gitlab.com/gitlab-org/cli", file=sys.stderr)
+        return None
+
+
+def get_repo_platform(repo_path):
+    """Determine the hosting platform of the repository.
+
+    Returns:
+        str: 'github', 'gitlab', or None if not recognized
+    """
     try:
         remote_url = run_git_command(repo_path, "config", "--get", "remote.origin.url")
         if not remote_url:
-            return False
-        return "github.com" in remote_url
+            return None
+
+        if "github.com" in remote_url:
+            return "github"
+        elif "gitlab" in remote_url:
+            return "gitlab"
+
+        return None
     except Exception:
-        return False
+        return None
+
+
+def is_github_repo(repo_path):
+    """Check if the repository is hosted on GitHub (deprecated - use get_repo_platform)."""
+    return get_repo_platform(repo_path) == "github"
 
 
 def get_repo_url(repo_path):
@@ -474,6 +516,267 @@ def get_github_pr_stats(repo_path, since):
     return stats
 
 
+def parse_relative_time(time_str, since):
+    """Check if a relative time string is within the since period."""
+    # Parse the time string like "about 18 hours ago", "about 1 day ago", "3 weeks ago"
+    time_str = time_str.lower().strip()
+
+    # Extract number and unit
+    import re
+
+    match = re.search(r"(\d+)\s*(hour|day|week|month|year)", time_str)
+    if not match:
+        # If we can't parse it, assume it's recent
+        return True
+
+    value = int(match.group(1))
+    unit = match.group(2)
+
+    # Convert to days
+    if unit == "hour":
+        days = value / 24.0
+    elif unit == "day":
+        days = value
+    elif unit == "week":
+        days = value * 7
+    elif unit == "month":
+        days = value * 30
+    elif unit == "year":
+        days = value * 365
+    else:
+        return True
+
+    # Parse the since parameter (e.g., "1.week", "2.months")
+    since_parts = since.split(".")
+    if len(since_parts) != 2:
+        return True
+
+    try:
+        since_num = int(since_parts[0])
+        since_unit = since_parts[1].lower()
+
+        # Convert since to days
+        if since_unit in ["week", "weeks"]:
+            since_days = since_num * 7
+        elif since_unit in ["month", "months"]:
+            since_days = since_num * 30
+        elif since_unit in ["year", "years"]:
+            since_days = since_num * 365
+        elif since_unit in ["day", "days"]:
+            since_days = since_num
+        else:
+            since_days = 7  # Default to 1 week
+
+        # Check if the item is within the time range
+        return days <= since_days
+    except (ValueError, IndexError):
+        return True
+
+
+def get_gitlab_issues_stats(repo_path, since):
+    """Get statistics about GitLab issues for the specified time period."""
+    stats = {"created": [], "updated": [], "closed": []}
+
+    # Get all open issues (for created), sorted by most recently created
+    created_output = run_glab_command(
+        repo_path,
+        "issue",
+        "list",
+        "--order",
+        "created_at",
+        "--sort",
+        "desc",
+        "--per-page",
+        "100",
+        silent=True,
+    )
+
+    if created_output:
+        # Parse glab output (format: #number\ttitle\t(state)\tcreated_at)
+        for line in created_output.split("\n"):
+            if line.strip() and line.startswith("#"):
+                try:
+                    # Extract issue number and other fields
+                    parts = line.split("\t")
+                    if len(parts) >= 2:
+                        number = parts[0].strip("#")
+                        title = parts[1].strip()
+
+                        # Check if there's a created_at field (usually the last field)
+                        created_at = parts[-1].strip() if len(parts) > 2 else ""
+
+                        # Filter by time range if we have created_at info
+                        if not created_at or parse_relative_time(created_at, since):
+                            stats["created"].append(
+                                {
+                                    "number": int(number),
+                                    "title": title,
+                                    "author": {"login": "Unknown"},
+                                    "state": "opened",
+                                }
+                            )
+                except (ValueError, IndexError):
+                    pass
+
+    # Get closed issues, sorted by most recently updated
+    closed_output = run_glab_command(
+        repo_path,
+        "issue",
+        "list",
+        "--state",
+        "closed",
+        "--order",
+        "updated_at",
+        "--sort",
+        "desc",
+        "--per-page",
+        "100",
+        silent=True,
+    )
+
+    if closed_output:
+        for line in closed_output.split("\n"):
+            if line.strip() and line.startswith("#"):
+                try:
+                    parts = line.split("\t")
+                    if len(parts) >= 2:
+                        number = parts[0].strip("#")
+                        title = parts[1].strip()
+
+                        # Check if there's a closed_at/updated_at field
+                        time_field = parts[-1].strip() if len(parts) > 2 else ""
+
+                        # Filter by time range
+                        if not time_field or parse_relative_time(time_field, since):
+                            stats["closed"].append(
+                                {
+                                    "number": int(number),
+                                    "title": title,
+                                    "author": {"login": "Unknown"},
+                                    "state": "closed",
+                                }
+                            )
+                except (ValueError, IndexError):
+                    pass
+
+    # For updated, we combine created and closed
+    stats["updated"] = stats["created"] + stats["closed"]
+
+    return stats
+
+
+def get_gitlab_mr_stats(repo_path, since):
+    """Get statistics about GitLab merge requests for the specified time period."""
+    stats = {"created": [], "updated": [], "merged": [], "closed": []}
+
+    # Get all open MRs (for created), sorted by most recently created
+    created_output = run_glab_command(
+        repo_path,
+        "mr",
+        "list",
+        "--order",
+        "created_at",
+        "--sort",
+        "desc",
+        "--per-page",
+        "100",
+        silent=True,
+    )
+
+    if created_output:
+        for line in created_output.split("\n"):
+            if line.strip() and line.startswith("!"):
+                try:
+                    parts = line.split("\t")
+                    if len(parts) >= 2:
+                        number = parts[0].strip("!")
+                        title = parts[1].strip()
+                        stats["created"].append(
+                            {
+                                "number": int(number),
+                                "title": title,
+                                "author": {"login": "Unknown"},
+                            }
+                        )
+                except (ValueError, IndexError):
+                    pass
+
+    # Get merged MRs, sorted by most recently merged
+    merged_output = run_glab_command(
+        repo_path,
+        "mr",
+        "list",
+        "--merged",
+        "--order",
+        "merged_at",
+        "--sort",
+        "desc",
+        "--per-page",
+        "100",
+        silent=True,
+    )
+
+    if merged_output:
+        for line in merged_output.split("\n"):
+            if line.strip() and line.startswith("!"):
+                try:
+                    parts = line.split("\t")
+                    if len(parts) >= 2:
+                        number = parts[0].strip("!")
+                        title = parts[1].strip()
+                        stats["merged"].append(
+                            {
+                                "number": int(number),
+                                "title": title,
+                                "author": {"login": "Unknown"},
+                            }
+                        )
+                except (ValueError, IndexError):
+                    pass
+
+    # Get closed MRs (not merged), sorted by most recently updated
+    closed_output = run_glab_command(
+        repo_path,
+        "mr",
+        "list",
+        "--closed",
+        "--order",
+        "updated_at",
+        "--sort",
+        "desc",
+        "--per-page",
+        "100",
+        silent=True,
+    )
+
+    if closed_output:
+        for line in closed_output.split("\n"):
+            if line.strip() and line.startswith("!"):
+                try:
+                    parts = line.split("\t")
+                    if len(parts) >= 2:
+                        number = parts[0].strip("!")
+                        title = parts[1].strip()
+                        # Only add if not already in merged list
+                        if not any(
+                            mr["number"] == int(number) for mr in stats["merged"]
+                        ):
+                            stats["closed"].append(
+                                {
+                                    "number": int(number),
+                                    "title": title,
+                                    "author": {"login": "Unknown"},
+                                }
+                            )
+                except (ValueError, IndexError):
+                    pass
+
+    # For updated, we combine all
+    stats["updated"] = stats["created"] + stats["merged"] + stats["closed"]
+
+    return stats
+
+
 def get_file_diffs(repo_path, since):
     """Get all diffs for files changed in the specified time period, grouped by file."""
     # Get all commits from the specified time period
@@ -529,24 +832,39 @@ def get_file_diffs(repo_path, since):
     return file_diffs
 
 
-def generate_github_summary_report(repo_path, since, period_description):
-    """Generate a high-level GitHub summary report with issues and PRs."""
+def generate_platform_summary_report(repo_path, since, period_description):
+    """Generate a high-level summary report with issues and PRs/MRs (supports GitHub and GitLab)."""
     repo_name = Path(repo_path).name
+    platform = get_repo_platform(repo_path)
 
     # Get the repository URL
     repo_url = get_repo_url(repo_path)
 
+    # Determine platform-specific labels
+    if platform == "gitlab":
+        platform_name = "GitLab"
+        pr_label_plural = "Merge Requests"
+        pr_short = "MR"
+    else:  # Default to GitHub
+        platform_name = "GitHub"
+        pr_label_plural = "Pull Requests"
+        pr_short = "PR"
+
     # Start building the markdown report
     report = []
-    report.append(f"# GitHub Activity Summary for {repo_name}")
+    report.append(f"# {platform_name} Activity Summary for {repo_name}")
     report.append(f"*Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
     report.append("")
     report.append(f"**Period:** {period_description}")
     report.append("")
 
-    # Get GitHub statistics
-    issue_stats = get_github_issues_stats(repo_path, since)
-    pr_stats = get_github_pr_stats(repo_path, since)
+    # Get platform statistics
+    if platform == "gitlab":
+        issue_stats = get_gitlab_issues_stats(repo_path, since)
+        pr_stats = get_gitlab_mr_stats(repo_path, since)
+    else:  # GitHub
+        issue_stats = get_github_issues_stats(repo_path, since)
+        pr_stats = get_github_pr_stats(repo_path, since)
 
     # Issues Summary
     report.append("## Issues Summary")
@@ -556,13 +874,13 @@ def generate_github_summary_report(repo_path, since, period_description):
     report.append(f"- **Issues Closed:** {len(issue_stats['closed'])}")
     report.append("")
 
-    # Pull Requests Summary
-    report.append("## Pull Requests Summary")
+    # Pull Requests / Merge Requests Summary
+    report.append(f"## {pr_label_plural} Summary")
     report.append("")
-    report.append(f"- **PRs Created:** {len(pr_stats['created'])}")
-    report.append(f"- **PRs Updated:** {len(pr_stats['updated'])}")
-    report.append(f"- **PRs Merged:** {len(pr_stats['merged'])}")
-    report.append(f"- **PRs Closed (not merged):** {len(pr_stats['closed'])}")
+    report.append(f"- **{pr_short}s Created:** {len(pr_stats['created'])}")
+    report.append(f"- **{pr_short}s Updated:** {len(pr_stats['updated'])}")
+    report.append(f"- **{pr_short}s Merged:** {len(pr_stats['merged'])}")
+    report.append(f"- **{pr_short}s Closed (not merged):** {len(pr_stats['closed'])}")
     report.append("")
 
     # Detailed Issues List
@@ -575,11 +893,14 @@ def generate_github_summary_report(repo_path, since, period_description):
                 if isinstance(issue.get("author"), dict)
                 else "Unknown"
             )
-            issue_link = (
-                f"[#{issue['number']}]({repo_url}/issues/{issue['number']})"
-                if repo_url
-                else f"#{issue['number']}"
-            )
+            if repo_url:
+                # GitLab uses /-/issues/, GitHub uses /issues/
+                issue_path = "/-/issues/" if platform == "gitlab" else "/issues/"
+                issue_link = (
+                    f"[#{issue['number']}]({repo_url}{issue_path}{issue['number']})"
+                )
+            else:
+                issue_link = f"#{issue['number']}"
             report.append(f"- {issue_link}: {issue['title']} (by @{author_login})")
         report.append("")
 
@@ -592,17 +913,23 @@ def generate_github_summary_report(repo_path, since, period_description):
                 if isinstance(issue.get("author"), dict)
                 else "Unknown"
             )
-            issue_link = (
-                f"[#{issue['number']}]({repo_url}/issues/{issue['number']})"
-                if repo_url
-                else f"#{issue['number']}"
-            )
+            if repo_url:
+                # GitLab uses /-/issues/, GitHub uses /issues/
+                issue_path = "/-/issues/" if platform == "gitlab" else "/issues/"
+                issue_link = (
+                    f"[#{issue['number']}]({repo_url}{issue_path}{issue['number']})"
+                )
+            else:
+                issue_link = f"#{issue['number']}"
             report.append(f"- {issue_link}: {issue['title']} (by @{author_login})")
         report.append("")
 
-    # Detailed PRs List
+    # Detailed PRs/MRs List
+    # Use ! for GitLab MRs, # for GitHub PRs
+    pr_prefix = "!" if platform == "gitlab" else "#"
+
     if pr_stats["created"]:
-        report.append("## Pull Requests Created")
+        report.append(f"## {pr_label_plural} Created")
         report.append("")
         for pr in pr_stats["created"]:
             author_login = (
@@ -610,16 +937,19 @@ def generate_github_summary_report(repo_path, since, period_description):
                 if isinstance(pr.get("author"), dict)
                 else "Unknown"
             )
-            pr_link = (
-                f"[#{pr['number']}]({repo_url}/pull/{pr['number']})"
-                if repo_url
-                else f"#{pr['number']}"
-            )
+            if repo_url:
+                # GitLab uses /-/merge_requests/, GitHub uses /pull/
+                pr_path = "/-/merge_requests/" if platform == "gitlab" else "/pull/"
+                pr_link = (
+                    f"[{pr_prefix}{pr['number']}]({repo_url}{pr_path}{pr['number']})"
+                )
+            else:
+                pr_link = f"{pr_prefix}{pr['number']}"
             report.append(f"- {pr_link}: {pr['title']} (by @{author_login})")
         report.append("")
 
     if pr_stats["merged"]:
-        report.append("## Pull Requests Merged")
+        report.append(f"## {pr_label_plural} Merged")
         report.append("")
         for pr in pr_stats["merged"]:
             author_login = (
@@ -627,16 +957,19 @@ def generate_github_summary_report(repo_path, since, period_description):
                 if isinstance(pr.get("author"), dict)
                 else "Unknown"
             )
-            pr_link = (
-                f"[#{pr['number']}]({repo_url}/pull/{pr['number']})"
-                if repo_url
-                else f"#{pr['number']}"
-            )
+            if repo_url:
+                # GitLab uses /-/merge_requests/, GitHub uses /pull/
+                pr_path = "/-/merge_requests/" if platform == "gitlab" else "/pull/"
+                pr_link = (
+                    f"[{pr_prefix}{pr['number']}]({repo_url}{pr_path}{pr['number']})"
+                )
+            else:
+                pr_link = f"{pr_prefix}{pr['number']}"
             report.append(f"- {pr_link}: {pr['title']} (by @{author_login})")
         report.append("")
 
     if pr_stats["closed"]:
-        report.append("## Pull Requests Closed (not merged)")
+        report.append(f"## {pr_label_plural} Closed (not merged)")
         report.append("")
         for pr in pr_stats["closed"]:
             author_login = (
@@ -644,15 +977,23 @@ def generate_github_summary_report(repo_path, since, period_description):
                 if isinstance(pr.get("author"), dict)
                 else "Unknown"
             )
-            pr_link = (
-                f"[#{pr['number']}]({repo_url}/pull/{pr['number']})"
-                if repo_url
-                else f"#{pr['number']}"
-            )
+            if repo_url:
+                # GitLab uses /-/merge_requests/, GitHub uses /pull/
+                pr_path = "/-/merge_requests/" if platform == "gitlab" else "/pull/"
+                pr_link = (
+                    f"[{pr_prefix}{pr['number']}]({repo_url}{pr_path}{pr['number']})"
+                )
+            else:
+                pr_link = f"{pr_prefix}{pr['number']}"
             report.append(f"- {pr_link}: {pr['title']} (by @{author_login})")
         report.append("")
 
     return "\n".join(report)
+
+
+def generate_github_summary_report(repo_path, since, period_description):
+    """Generate a high-level GitHub summary report (deprecated - use generate_platform_summary_report)."""
+    return generate_platform_summary_report(repo_path, since, period_description)
 
 
 def show_help():
@@ -670,7 +1011,7 @@ ARGUMENTS:
 OPTIONS:
     --time-range RANGE      Time period for the report (default: 1.week)
     --output-dir DIR        Directory where reports will be saved (default: current directory)
-    --report-type TYPE      Type of report to generate: all, commits, github (default: all)
+    --report-type TYPE      Type of report to generate: all, commits, platform (default: all)
     -h, --help              Show this help message
 
 TIME RANGE OPTIONS:
@@ -683,9 +1024,10 @@ TIME RANGE OPTIONS:
     1.year          Last 365 days
 
 REPORT TYPES:
-    all             Generate both commit report and GitHub summary (default)
+    all             Generate both commit report and platform summary (default)
     commits         Generate only the detailed commit report
-    github          Generate only the GitHub activity summary (requires GitHub CLI)
+    platform        Generate only the platform activity summary (requires GitHub CLI 'gh' for
+                    GitHub repos, GitLab CLI 'glab' for GitLab repos)
 
 EXAMPLES:
     # Generate both reports for last week, save to current directory
@@ -697,24 +1039,31 @@ EXAMPLES:
     # Generate only commit report for last month, save to /tmp
     ./git_report_gen.py /path/to/repo --time-range 1.month --output-dir /tmp --report-type commits
 
-    # Generate only GitHub summary for last 3 months, save to ~/reports
-    ./git_report_gen.py /path/to/repo --time-range 3.months --output-dir ~/reports --report-type github
+    # Generate only platform summary for last 3 months, save to ~/reports
+    ./git_report_gen.py /path/to/repo --time-range 3.months --output-dir ~/reports --report-type platform
 
 OUTPUT:
     Reports will be saved as markdown files with the following formats:
     - Commit report: YYYYMMDD_<repo_name>_<time_range>_commit_report.md
     - GitHub summary: YYYYMMDD_<repo_name>_<time_range>_github_summary.md
+    - GitLab summary: YYYYMMDD_<repo_name>_<time_range>_gitlab_summary.md
 
     Commit report includes:
     - File change statistics (added, modified, deleted)
     - Commit summary by author
-    - Detailed commits by author
+    - Detailed commits by author with clickable links
     - Complete file diffs for all changes
+    - Works with both GitHub and GitLab repositories
 
-    GitHub summary includes (requires GitHub CLI 'gh'):
-    - Issues created, updated, and closed
-    - Pull requests created, updated, merged, and closed
-    - Detailed lists of all issues and PRs
+    Platform summary includes:
+    - GitHub (requires GitHub CLI 'gh'):
+      - Issues created, updated, and closed
+      - Pull requests created, updated, merged, and closed
+      - Detailed lists of all issues and PRs with clickable links
+    - GitLab (requires GitLab CLI 'glab'):
+      - Issues created, updated, and closed
+      - Merge requests created, updated, merged, and closed
+      - Detailed lists of all issues and MRs with clickable links
 """
     print(help_text)
 
@@ -838,7 +1187,7 @@ def main():
     )
     parser.add_argument(
         "--report-type",
-        choices=["all", "commits", "github"],
+        choices=["all", "commits", "platform", "github"],
         default="all",
         help="Type of report to generate (default: all)",
     )
@@ -856,6 +1205,10 @@ def main():
     since = args.time_range
     output_dir = args.output_dir
     report_type = args.report_type
+
+    # Handle backwards compatibility: "github" -> "platform"
+    if report_type == "github":
+        report_type = "platform"
 
     # Check if the path is a valid git repository
     if not Path(repo_path).is_dir():
@@ -917,34 +1270,38 @@ def main():
         generated_reports.append(str(commit_output_file))
         print(f"✓ Commit report generated: {commit_output_file}")
 
-    if report_type in ["all", "github"]:
-        # Check if this is a GitHub repository
-        if not is_github_repo(repo_path):
-            print(f"⚠ Skipping GitHub summary: {repo_name} is not hosted on GitHub")
-            if report_type == "github":
+    if report_type in ["all", "platform"]:
+        # Check if this is a GitHub or GitLab repository
+        platform = get_repo_platform(repo_path)
+        if not platform:
+            print(
+                f"⚠ Skipping platform summary: {repo_name} is not hosted on GitHub or GitLab"
+            )
+            if report_type == "platform":
                 print(
-                    "Error: Cannot generate GitHub-only report for non-GitHub repository"
+                    "Error: Cannot generate platform summary for non-GitHub/GitLab repository"
                 )
                 sys.exit(1)
         else:
-            # Generate the GitHub summary report
-            print(f"Generating GitHub summary for {repo_name}...")
-            github_report = generate_github_summary_report(
+            # Generate the platform summary report
+            platform_name = "GitHub" if platform == "github" else "GitLab"
+            print(f"Generating {platform_name} summary for {repo_name}...")
+            platform_report = generate_platform_summary_report(
                 repo_path, since, period_description
             )
 
             # Create output filename
-            github_filename = (
-                f"{current_date}_{repo_name}_{filename_period}_github_summary.md"
+            platform_filename = (
+                f"{current_date}_{repo_name}_{filename_period}_{platform}_summary.md"
             )
-            github_output_file = output_path / github_filename
+            platform_output_file = output_path / platform_filename
 
             # Write report to file
-            with open(github_output_file, "w") as f:
-                f.write(github_report)
+            with open(platform_output_file, "w") as f:
+                f.write(platform_report)
 
-            generated_reports.append(str(github_output_file))
-            print(f"✓ GitHub summary generated: {github_output_file}")
+            generated_reports.append(str(platform_output_file))
+            print(f"✓ {platform_name} summary generated: {platform_output_file}")
 
     # Summary
     print(f"\n{'=' * 60}")
