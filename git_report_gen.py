@@ -24,7 +24,7 @@ def run_git_command(repo_path, *args):
         return None
 
 
-def run_gh_command(repo_path, *args):
+def run_gh_command(repo_path, *args, silent=False):
     """Run a GitHub CLI command in the specified repository."""
     try:
         result = subprocess.run(
@@ -36,13 +36,57 @@ def run_gh_command(repo_path, *args):
         )
         return result.stdout.strip()
     except subprocess.CalledProcessError as e:
+        # Silently return None for expected failures (auth issues, rate limits, etc.)
+        if silent:
+            return None
         print(f"Error running gh command: {e}", file=sys.stderr)
         return None
     except FileNotFoundError:
-        print(
-            "Error: GitHub CLI (gh) is not installed or not in PATH.", file=sys.stderr
-        )
-        print("Install it from: https://cli.github.com/", file=sys.stderr)
+        if not silent:
+            print(
+                "Error: GitHub CLI (gh) is not installed or not in PATH.",
+                file=sys.stderr,
+            )
+            print("Install it from: https://cli.github.com/", file=sys.stderr)
+        return None
+
+
+def is_github_repo(repo_path):
+    """Check if the repository is hosted on GitHub."""
+    try:
+        remote_url = run_git_command(repo_path, "config", "--get", "remote.origin.url")
+        if not remote_url:
+            return False
+        return "github.com" in remote_url
+    except Exception:
+        return False
+
+
+def get_github_repo_url(repo_path):
+    """Get the GitHub repository URL from git remote."""
+    try:
+        # Get the remote URL
+        remote_url = run_git_command(repo_path, "config", "--get", "remote.origin.url")
+        if not remote_url:
+            return None
+
+        # Convert SSH URLs to HTTPS format
+        # SSH format: git@github.com:owner/repo.git
+        # HTTPS format: https://github.com/owner/repo.git or https://github.com/owner/repo
+        if remote_url.startswith("git@github.com:"):
+            # Convert git@github.com:owner/repo.git to https://github.com/owner/repo
+            repo_part = remote_url.replace("git@github.com:", "")
+            if repo_part.endswith(".git"):
+                repo_part = repo_part[:-4]  # Remove .git suffix
+            return f"https://github.com/{repo_part}"
+        elif "github.com" in remote_url:
+            # Already HTTPS, just remove .git if present
+            if remote_url.endswith(".git"):
+                return remote_url[:-4]  # Remove .git suffix
+            return remote_url
+
+        return None
+    except Exception:
         return None
 
 
@@ -242,6 +286,7 @@ def get_github_issues_stats(repo_path, since):
         "number,title,author,createdAt,state",
         "--limit",
         "1000",
+        silent=True,
     )
 
     if created_output:
@@ -261,6 +306,7 @@ def get_github_issues_stats(repo_path, since):
         "number,title,author,updatedAt,state",
         "--limit",
         "1000",
+        silent=True,
     )
 
     if updated_output:
@@ -282,6 +328,7 @@ def get_github_issues_stats(repo_path, since):
         "number,title,author,closedAt,state",
         "--limit",
         "1000",
+        silent=True,
     )
 
     if closed_output:
@@ -311,6 +358,7 @@ def get_github_pr_stats(repo_path, since):
         "number,title,author,createdAt,state",
         "--limit",
         "1000",
+        silent=True,
     )
 
     if created_output:
@@ -330,6 +378,7 @@ def get_github_pr_stats(repo_path, since):
         "number,title,author,updatedAt,state",
         "--limit",
         "1000",
+        silent=True,
     )
 
     if updated_output:
@@ -351,6 +400,7 @@ def get_github_pr_stats(repo_path, since):
         "number,title,author,mergedAt",
         "--limit",
         "1000",
+        silent=True,
     )
 
     if merged_output:
@@ -372,6 +422,7 @@ def get_github_pr_stats(repo_path, since):
         "number,title,author,closedAt",
         "--limit",
         "1000",
+        silent=True,
     )
 
     if closed_output:
@@ -442,6 +493,9 @@ def generate_github_summary_report(repo_path, since, period_description):
     """Generate a high-level GitHub summary report with issues and PRs."""
     repo_name = Path(repo_path).name
 
+    # Get the GitHub repository URL
+    repo_url = get_github_repo_url(repo_path)
+
     # Start building the markdown report
     report = []
     report.append(f"# GitHub Activity Summary for {repo_name}")
@@ -481,9 +535,12 @@ def generate_github_summary_report(repo_path, since, period_description):
                 if isinstance(issue.get("author"), dict)
                 else "Unknown"
             )
-            report.append(
-                f"- #{issue['number']}: {issue['title']} (by @{author_login})"
+            issue_link = (
+                f"[#{issue['number']}]({repo_url}/issues/{issue['number']})"
+                if repo_url
+                else f"#{issue['number']}"
             )
+            report.append(f"- {issue_link}: {issue['title']} (by @{author_login})")
         report.append("")
 
     if issue_stats["closed"]:
@@ -495,9 +552,12 @@ def generate_github_summary_report(repo_path, since, period_description):
                 if isinstance(issue.get("author"), dict)
                 else "Unknown"
             )
-            report.append(
-                f"- #{issue['number']}: {issue['title']} (by @{author_login})"
+            issue_link = (
+                f"[#{issue['number']}]({repo_url}/issues/{issue['number']})"
+                if repo_url
+                else f"#{issue['number']}"
             )
+            report.append(f"- {issue_link}: {issue['title']} (by @{author_login})")
         report.append("")
 
     # Detailed PRs List
@@ -510,7 +570,12 @@ def generate_github_summary_report(repo_path, since, period_description):
                 if isinstance(pr.get("author"), dict)
                 else "Unknown"
             )
-            report.append(f"- #{pr['number']}: {pr['title']} (by @{author_login})")
+            pr_link = (
+                f"[#{pr['number']}]({repo_url}/pull/{pr['number']})"
+                if repo_url
+                else f"#{pr['number']}"
+            )
+            report.append(f"- {pr_link}: {pr['title']} (by @{author_login})")
         report.append("")
 
     if pr_stats["merged"]:
@@ -522,7 +587,12 @@ def generate_github_summary_report(repo_path, since, period_description):
                 if isinstance(pr.get("author"), dict)
                 else "Unknown"
             )
-            report.append(f"- #{pr['number']}: {pr['title']} (by @{author_login})")
+            pr_link = (
+                f"[#{pr['number']}]({repo_url}/pull/{pr['number']})"
+                if repo_url
+                else f"#{pr['number']}"
+            )
+            report.append(f"- {pr_link}: {pr['title']} (by @{author_login})")
         report.append("")
 
     if pr_stats["closed"]:
@@ -534,7 +604,12 @@ def generate_github_summary_report(repo_path, since, period_description):
                 if isinstance(pr.get("author"), dict)
                 else "Unknown"
             )
-            report.append(f"- #{pr['number']}: {pr['title']} (by @{author_login})")
+            pr_link = (
+                f"[#{pr['number']}]({repo_url}/pull/{pr['number']})"
+                if repo_url
+                else f"#{pr['number']}"
+            )
+            report.append(f"- {pr_link}: {pr['title']} (by @{author_login})")
         report.append("")
 
     return "\n".join(report)
@@ -608,6 +683,9 @@ def generate_markdown_report(repo_path, since, period_description):
     """Generate a markdown report of git commits for the specified time period."""
     repo_name = Path(repo_path).name
 
+    # Get the GitHub repository URL
+    repo_url = get_github_repo_url(repo_path)
+
     # Start building the markdown report
     report = []
     report.append(f"# Git Commit Report for {repo_name}")
@@ -656,9 +734,12 @@ def generate_markdown_report(repo_path, since, period_description):
         report.append("")
 
         for commit in commits:
-            report.append(
-                f"- [{commit['hash']}] {commit['subject']} *({commit['date']})*"
+            commit_link = (
+                f"[{commit['hash']}]({repo_url}/commit/{commit['hash']})"
+                if repo_url
+                else commit["hash"]
             )
+            report.append(f"- [{commit_link}] {commit['subject']} *({commit['date']})*")
 
         report.append("")
         report.append("---")
@@ -794,24 +875,33 @@ def main():
         print(f"✓ Commit report generated: {commit_output_file}")
 
     if report_type in ["all", "github"]:
-        # Generate the GitHub summary report
-        print(f"Generating GitHub summary for {repo_name}...")
-        github_report = generate_github_summary_report(
-            repo_path, since, period_description
-        )
+        # Check if this is a GitHub repository
+        if not is_github_repo(repo_path):
+            print(f"⚠ Skipping GitHub summary: {repo_name} is not hosted on GitHub")
+            if report_type == "github":
+                print(
+                    "Error: Cannot generate GitHub-only report for non-GitHub repository"
+                )
+                sys.exit(1)
+        else:
+            # Generate the GitHub summary report
+            print(f"Generating GitHub summary for {repo_name}...")
+            github_report = generate_github_summary_report(
+                repo_path, since, period_description
+            )
 
-        # Create output filename
-        github_filename = (
-            f"{current_date}_{repo_name}_{filename_period}_github_summary.md"
-        )
-        github_output_file = output_path / github_filename
+            # Create output filename
+            github_filename = (
+                f"{current_date}_{repo_name}_{filename_period}_github_summary.md"
+            )
+            github_output_file = output_path / github_filename
 
-        # Write report to file
-        with open(github_output_file, "w") as f:
-            f.write(github_report)
+            # Write report to file
+            with open(github_output_file, "w") as f:
+                f.write(github_report)
 
-        generated_reports.append(str(github_output_file))
-        print(f"✓ GitHub summary generated: {github_output_file}")
+            generated_reports.append(str(github_output_file))
+            print(f"✓ GitHub summary generated: {github_output_file}")
 
     # Summary
     print(f"\n{'=' * 60}")
